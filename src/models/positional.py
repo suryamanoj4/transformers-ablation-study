@@ -20,26 +20,27 @@ class SinusoidalEmbeddings(nn.Module):
     def forward(self, x):
         return x + self.pe[:, : x.size(1)]
 
-def _precompute_freqs(d_k, max_len, base=10000.0):
-    """cos/sin tables per head dim, half-split: (max_len, d_k//2)."""
-    i = torch.arange(d_k // 2)
-    freqs = 1.0 / (base ** (2 * i / d_k))
-    t = torch.arange(max_len)
-    angles = t.unsqueeze(1) * freqs.unsqueeze(0)
-    return torch.cos(angles), torch.sin(angles)
-
 def _rotate_half(x):
     """swap  + negate the second half: [x2; -x1] --> used to rotate pairs"""
     d=x.size(-1)
     x1, x2 =x[..., : d //2], x[..., d//2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary_emb(q, k, max_len=512):
-    """contract with attentio.py: q,k are (B, H, S, d_k); positions from S."""
-    b, h, s, d_k = q.size()
-    cos, sin = _precompute_freqs(d_k, max_len)
-    cos = cos[:s].view(1,1,s,d_k//2).to(q.device)
-    sin = sin[:s].view(1,1,s,d_k//2).to(q.device)
-    q = q * cos + _rotate_half(q) * sin
-    k = k * cos + _rotate_half(k) * sin
-    return q, k
+class RotaryEmbedding(nn.Module):
+    """Precompute cos/sin once; buffer follows models device"""
+
+    def __init__(self, d_k, max_len=512, base=10000.0):
+        super().__init__()
+        assert d_k % 2 == 0
+        i = torch.arange(d_k // 2)
+        freqs = 1.0 / (base ** (2 * i / d_k))
+        t = torch.arange(max_len)
+        angles = t.unsqueeze(1) * freqs.unsqueeze(0)
+        self.register_buffer("cos", torch.cos(angles).view(1, 1, max_len, d_k // 2))
+        self.register_buffer("sin", torch.sin(angles).view(1, 1, max_len, d_k // 2))
+
+    def rotate(self,q, k):
+        s = q.size(2)
+        cos = self.cos[:, :, :s]
+        sin = self.sin[:, :, :s]
+        return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
