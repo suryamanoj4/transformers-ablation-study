@@ -36,8 +36,8 @@ class RotaryEmbedding(nn.Module):
         freqs = 1.0 / (base ** (2 * i / d_k))
         t = torch.arange(max_len)
         angles = t.unsqueeze(1) * freqs.unsqueeze(0)
-        self.register_buffer("cos", torch.cos(angles).view(1, 1, max_len, d_k // 2))
-        self.register_buffer("sin", torch.sin(angles).view(1, 1, max_len, d_k // 2))
+        self.register_buffer("cos", torch.cos(angles).repeat_interleave(2, dim=-1).view(1, 1, max_len, d_k))
+        self.register_buffer("sin", torch.sin(angles).repeat_interleave(2, dim=-1).view(1, 1, max_len, d_k))
 
     def rotate(self,q, k):
         s = q.size(2)

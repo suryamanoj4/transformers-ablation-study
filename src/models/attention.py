@@ -17,7 +17,7 @@ class ScaledDotProductAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(d_k)
         if mask is not None:
             if mask.dtype == torch.bool:
-                scores = scores.masked_fill(mask, float("-inf"))
+                scores = scores.masked_fill(~mask, float("-inf"))
             else:
                 scores = scores + mask
         attn = self.dropout(f.softmax(scores, dim=-1))
@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         q = self.q_proj(x).view(b, s, self.n_heads, self.d_k).transpose(1,2)
         k = self.k_proj(kv).view(b, -1, self.n_heads, self.d_k).transpose(1,2)
         v = self.v_proj(kv).view(b, -1, self.n_heads, self.d_k).transpose(1,2)
-        if self.rope is not None:
+        if self.rope is not None and kv is None:
             q, k = self.rope.rotate(q, k)
         out = self.attn(q ,k ,v ,mask=mask)
         out = out.transpose(1, 2).contiguous().view(b, s, self.d_model)
@@ -71,7 +71,7 @@ class GroupedQueryAttention(nn.Module):
         q = self.q_proj(x).view(b, s, self.n_heads, self.d_k).transpose(1,2)
         k = self.k_proj(kv).view(b, -1, self.n_kv_heads, self.d_k).transpose(1,2)
         v = self.v_proj(kv).view(b, -1, self.n_kv_heads, self.d_k).transpose(1,2)
-        if self.rope is not None:
+        if self.rope is not None and kv is None:
             q, k = self.rope.rotate(q, k)
         group = self.n_heads // self.n_kv_heads
         k = k.repeat_interleave(group, dim=1)
