@@ -65,12 +65,12 @@ class BLTModel(nn.Module):
         self.global_dec = Decoder(cfg, vocab_size=None, with_output_head=False)
         self.bos = nn.Parameter(torch.zeros(cfg["d_model"]))
 
-    def forward(self, src_bytes, tgt_bytes, src_mask=None, tgt_pad=None):
+    def forward(self, src_bytes, tgt_bytes, src_mask=None):
         src_p = self.local_enc(src_bytes, src_mask)
         enc_out = self.global_enc(src_p)
         tgt_p = self.local_enc(tgt_bytes)
         bos = self.bos.view(1, 1, -1).expand(tgt_p.size(0), 1, -1)
         dec_in = torch.cat([bos, tgt_p[:, :-1]], dim=1)
-        reps = self.global_dec(dec_in, enc_out, src_mask=src_mask)
+        reps = self.global_dec(dec_in, enc_out)
         logits = self.local_dec(reps, enc_out)
-        return logits
+        return logits[:, : tgt_bytes.size(1)]
