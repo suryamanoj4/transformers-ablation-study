@@ -71,9 +71,9 @@ class DecoderBlock(nn.Module):
         return x
 
 class Encoder(nn.Module):
-    def __init__(self, cfg, vocab_size):
+    def __init__(self, cfg, vocab_size=None):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, cfg["d_model"])
+        self.embed = nn.Embedding(vocab_size, cfg["d_model"]) if vocab_size is not None else nn.Identity()
         self.pos = (SinusoidalEmbeddings(cfg["d_model"], cfg["max_len"])
                     if not cfg["use_rope"] else nn.Identity())
         self.dropout = nn.Dropout(cfg["dropout"])
@@ -87,15 +87,15 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 class Decoder(nn.Module):
-    def __init__(self, cfg, vocab_size):
+    def __init__(self, cfg, vocab_size=None, with_output_head=True):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, cfg["d_model"])
+        self.embed = nn.Embedding(vocab_size, cfg["d_model"]) if vocab_size is not None else nn.Identity()
         self.pos = (SinusoidalEmbeddings(cfg["d_model"], cfg["max_len"])
                     if not cfg["use_rope"] else nn.Identity())
         self.dropout = nn.Dropout(cfg["dropout"])
         self.blocks = nn.ModuleList([DecoderBlock(cfg) for _ in range(cfg["n_layers"])])
         self.norm = _build_norm(cfg)(cfg["d_model"])
-        self.out_proj = nn.Linear(cfg["d_model"], vocab_size)
+        self.out_proj = nn.Linear(cfg["d_model"], vocab_size) if with_output_head else nn.Identity()
 
     def forward(self, tgt, enc_out, src_mask=None, tgt_mask=None):
         x = self.dropout(self.pos(self.embed(tgt)))
