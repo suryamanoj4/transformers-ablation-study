@@ -66,6 +66,8 @@ class BLTModel(nn.Module):
         self.bos = nn.Parameter(torch.zeros(cfg["d_model"]))
 
     def forward(self, src_bytes, tgt_bytes, src_mask=None):
+        if src_mask is not None and src_mask.dim() == 4:
+            src_mask = src_mask[:, 0, 0]
         src_p = self.local_enc(src_bytes, src_mask)
         enc_out = self.global_enc(src_p)
         tgt_p = self.local_enc(tgt_bytes)
