@@ -11,3 +11,10 @@ wheels/
 
 # Dataset 
 Dataset_A1/
+
+# Secrets
+.env
+
+# Training artifacts
+outputs/
+wandb/

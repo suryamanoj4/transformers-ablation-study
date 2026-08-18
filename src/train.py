@@ -15,10 +15,25 @@ import utils
 
 OUT_DIR = "outputs"
 
+
+def load_dotenv(path=".env"):
+    """Minimal .env loader: sets KEY=VALUE pairs into os.environ (no overwrite)."""
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+
 BASE = dict(d_model=128, d_ff=512, n_heads=4, n_kv_heads=1, n_layers=4,
-            dropout=0.1, max_len=1024, eval_max_len=1024, patch_size=8,
+            dropout=0.1, max_len=512, eval_max_len=512, patch_size=8,
             n_local_layers=2, src_vocab=256, tgt_vocab=4000,
-            batch_size=16, lr=1e-3, epochs=8, log_every=10,
+            batch_size=16, lr=1e-3, epochs=5, log_every=10,
             train_frac=0.8, val_frac=0.1, seed=42,
             data_dir="Dataset_A1", cipher_file="brown_cipher.txt",
             plain_file="brown_plain.txt")
@@ -177,6 +192,7 @@ def train_one_config(name, cfg, tokenizer, smoke=False, use_wandb=True):
 
 
 def main():
+    load_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs", default="all", help="e.g. C1,C2 or all")
     ap.add_argument("--smoke", action="store_true", help="1 batch, 1 epoch, no wandb")
@@ -192,13 +208,19 @@ def main():
         cache_path=os.path.join(OUT_DIR, f"bpe_{CONFIGS['C1']['tgt_vocab']}.json"))
 
     results, histories = {}, {}
+    results_path = os.path.join(OUT_DIR, "ablation_results.json")
+    if os.path.exists(results_path):
+        import json as _json
+        with open(results_path) as f:
+            results = _json.load(f)
     for name in names:
         results[name], hist = train_one_config(name, CONFIGS[name], tokenizer,
                                                smoke=args.smoke,
                                                use_wandb=(not args.no_wandb and not args.smoke))
         histories[name] = hist
 
-    utils.save_json(results, os.path.join(OUT_DIR, "ablation_results.json"))
+    utils.save_json(results, results_path)
+    utils.save_json(histories, os.path.join(OUT_DIR, "histories.json"))
     utils.plot_loss_curves(histories, os.path.join(OUT_DIR, "loss_curves.png"))
     metric_maps = {k: v["metrics"] for k, v in results.items()}
     utils.plot_metrics_bar(metric_maps, os.path.join(OUT_DIR, "metrics_bar.png"))

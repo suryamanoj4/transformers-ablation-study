@@ -4,9 +4,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from nltk.metrics.distance import edit_distance
+from nltk.metrics import distance as _nltk_distance
 from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
 from rouge_score import rouge_scorer
+
+# nltk guards against DoS on long inputs (default 2000); our refs/preds can be
+# ~2700 chars, so raise the limit for trusted local strings.
+_nltk_distance.MAX_DISTANCE_INPUT_LEN = 10000
 
 
 def _bits(text):
@@ -25,7 +29,7 @@ def sequence_accuracy(preds, refs):
 
 
 def levenshtein(pred, ref):
-    return edit_distance(pred, ref)
+    return _nltk_distance.edit_distance(pred, ref)
 
 
 def bleu(preds, refs):
