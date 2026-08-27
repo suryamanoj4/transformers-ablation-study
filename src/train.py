@@ -30,10 +30,11 @@ def load_dotenv(path=".env"):
                 if key and key not in os.environ:
                     os.environ[key] = value
 
-BASE = dict(d_model=128, d_ff=512, n_heads=4, n_kv_heads=1, n_layers=4,
+BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=6,
             dropout=0.1, max_len=512, eval_max_len=512, patch_size=8,
             n_local_layers=2, src_vocab=256, tgt_vocab=4000,
-            batch_size=16, lr=1e-3, epochs=5, log_every=10,
+            src_vocab_cipher=1500,
+            batch_size=16, lr=1e-3, epochs=12, log_every=1,
             train_frac=0.8, val_frac=0.1, seed=42,
             data_dir="Dataset_A1", cipher_file="brown_cipher.txt",
             plain_file="brown_plain.txt")
@@ -47,21 +48,22 @@ CONFIGS = {
 }
 
 
-def build_model(cfg, tgt_vocab):
+def build_model(cfg, tgt_vocab, src_vocab=None):
     model_cfg = dict(cfg, attention=cfg["attention"], norm=cfg["norm"],
                      use_rope=cfg["use_rope"])
     if cfg["tokenization"] == "bytes":
         return BLTModel(model_cfg, cfg["patch_size"], cfg["n_local_layers"])
-    return EncoderDecoder(model_cfg, src_vocab_size=cfg["src_vocab"],
+    src_vocab = cfg["src_vocab"] if src_vocab is None else src_vocab
+    return EncoderDecoder(model_cfg, src_vocab_size=src_vocab,
                           tgt_vocab_size=tgt_vocab)
 
 
-def make_loaders(cfg, tokenizer):
+def make_loaders(cfg, src_tokenizer, tgt_tokenizer):
     mode = cfg["tokenization"]
-    pad = 0 if mode == "bytes" else tokenizer.token_to_id("<pad>")
+    pad = 0 if mode == "bytes" else tgt_tokenizer.token_to_id("<pad>")
     ds = CipherDataset(os.path.join(cfg["data_dir"], cfg["cipher_file"]),
                        os.path.join(cfg["data_dir"], cfg["plain_file"]),
-                       tokenizer, mode=mode, max_len=cfg["max_len"])
+                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=cfg["max_len"])
     gen = torch.Generator().manual_seed(cfg["seed"])
     n = len(ds)
     n_tr = int(n * cfg["train_frac"])
@@ -134,14 +136,16 @@ def evaluate(model, loader, cfg, tokenizer, max_len=None, max_batches=None):
     return utils.evaluate_texts(preds, refs, tokenized=(cfg["tokenization"] == "bpe"))
 
 
-def train_one_config(name, cfg, tokenizer, smoke=False, use_wandb=True):
+def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wandb=True):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(cfg["seed"])
     print(f"\n=== {name}: attention={cfg['attention']} norm={cfg['norm']} "
           f"rope={cfg['use_rope']} tokenization={cfg['tokenization']} | {device} ===")
 
-    tr, va, te = make_loaders(cfg, tokenizer)
-    model = build_model(cfg, cfg["tgt_vocab"]).to(device)
+    src_vocab = (cipher_tok.get_vocab_size() if cipher_tok is not None
+                 else cfg["src_vocab"])
+    tr, va, te = make_loaders(cfg, cipher_tok, tokenizer)
+    model = build_model(cfg, cfg["tgt_vocab"], src_vocab).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"])
 
     if use_wandb:
@@ -207,6 +211,11 @@ def main():
         CONFIGS["C1"]["tgt_vocab"],
         cache_path=os.path.join(OUT_DIR, f"bpe_{CONFIGS['C1']['tgt_vocab']}.json"))
 
+    cipher_tok = build_bpe_tokenizer(
+        os.path.join(CONFIGS["C1"]["data_dir"], CONFIGS["C1"]["cipher_file"]),
+        CONFIGS["C1"]["src_vocab_cipher"],
+        cache_path=os.path.join(OUT_DIR, f"bpe_cipher_{CONFIGS['C1']['src_vocab_cipher']}.json"))
+
     results, histories = {}, {}
     results_path = os.path.join(OUT_DIR, "ablation_results.json")
     if os.path.exists(results_path):
@@ -215,6 +224,7 @@ def main():
             results = _json.load(f)
     for name in names:
         results[name], hist = train_one_config(name, CONFIGS[name], tokenizer,
+                                               cipher_tok=cipher_tok,
                                                smoke=args.smoke,
                                                use_wandb=(not args.no_wandb and not args.smoke))
         histories[name] = hist

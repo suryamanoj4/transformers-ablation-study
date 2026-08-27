@@ -23,15 +23,17 @@ def train_bpe_tokenizer(texts, vocab_size=4000, save_path=None):
         tok.save(save_path)
     return tok
 
-def build_bpe_tokenizer(plain_path, vocab_size=4000, cache_path=None):
-    """load cached tokenizer, or train an a plaintext corpus and cache it."""
+def build_bpe_tokenizer(corpus_path, vocab_size=4000, cache_path=None):
+    """Load cached tokenizer, or train on a corpus and cache it."""
     if cache_path and os.path.exists(cache_path):
         return Tokenizer.from_file(cache_path)
-    tok = train_bpe_tokenizer(load_lines(plain_path), vocab_size, save_path=cache_path)
+    tok = train_bpe_tokenizer(load_lines(corpus_path), vocab_size, save_path=cache_path)
     return tok
 
-def encode_src(line):
-    """cipher line --> raw byte ids (vocab 256)"""
+def encode_src(tok, line, mode):
+    """mode='bpe': learned subword ids over the cipher. mode='bytes': raw byte ids."""
+    if mode == "bpe":
+        return tok.encode(line).ids
     return list(line.encode("utf-8"))
 
 def encode_tgt(tok, line, mode):
@@ -41,11 +43,13 @@ def encode_tgt(tok, line, mode):
     return list(line.encode("utf-8"))
 
 class CipherDataset(Dataset):
-    def __init__(self, cipher_path, plain_path, tokenizer, mode="bpe", max_len=512):
-        self.ciphers = load_lines( cipher_path)
+    def __init__(self, cipher_path, plain_path, src_tokenizer, tgt_tokenizer,
+                 mode="bpe", max_len=512):
+        self.ciphers = load_lines(cipher_path)
         self.plains = load_lines(plain_path)
         assert len(self.ciphers) == len(self.plains)
-        self.tokenizer = tokenizer
+        self.src_tokenizer = src_tokenizer
+        self.tgt_tokenizer = tgt_tokenizer
         self.mode = mode
         self.max_len = max_len
 
@@ -53,8 +57,8 @@ class CipherDataset(Dataset):
         return len(self.ciphers)
 
     def __getitem__(self, i):
-        src = encode_src(self.ciphers[i])[: self.max_len]
-        tgt = encode_tgt(self.tokenizer, self.plains[i], self.mode)[: self.max_len]
+        src = encode_src(self.src_tokenizer, self.ciphers[i], self.mode)[: self.max_len]
+        tgt = encode_tgt(self.tgt_tokenizer, self.plains[i], self.mode)[: self.max_len]
         return {"src": torch.tensor(src, dtype=torch.long),
                 "tgt": torch.tensor(tgt, dtype=torch.long)}
 
