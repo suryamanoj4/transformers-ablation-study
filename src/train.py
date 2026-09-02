@@ -33,10 +33,10 @@ def load_dotenv(path=".env"):
 BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=3,
             dropout=0.1, max_len=512, eval_max_len=512, patch_size=8,
             n_local_layers=2, tgt_vocab=4000, src_vocab_cipher=1500,
-            batch_size=16, lr=1e-3, warmup_steps=2000, label_smoothing=0.1,
+            batch_size=32, warmup_steps=1000, label_smoothing=0.1,
             amp=True, max_len_bytes=8192, eval_max_len_bytes=2048,
             max_len_patches=1024, local_window=512,
-            epochs=30, log_every=1,
+            epochs=20, log_every=1, patience=3, min_delta=0.003,
             train_frac=0.8, val_frac=0.1, seed=42,
             data_dir="Dataset_A1", cipher_file="brown_cipher.txt",
             plain_file="brown_plain.txt")
@@ -209,6 +209,13 @@ def evaluate(model, loader, cfg, tokenizer, max_len=None, max_batches=None):
     return utils.evaluate_texts(preds, refs, tokenized=(cfg["tokenization"] == "bpe"))
 
 
+def _early_stop_update(best_val, best_epoch, no_improve, vloss, min_delta, ep):
+    """returns (best_val, best_epoch, no_improve) after one epoch's val loss."""
+    if vloss < best_val - min_delta:
+        return vloss, ep + 1, 0
+    return best_val, best_epoch, no_improve + 1
+
+
 def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wandb=True):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(cfg["seed"])
@@ -230,6 +237,7 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
     hist, steps_done, epoch_times = [], 0, []
     last_loss, best_val = float("nan"), float("inf")
     snapshots = []
+    best_epoch, no_improve, stop = 0, 0, False
     n_epochs = 1 if smoke else cfg["epochs"]
     for ep in range(n_epochs):
         model.train()
@@ -251,13 +259,18 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
         dt = time.perf_counter() - t0
         epoch_times.append(dt)
         vloss = val_loss(model, va, cfg, device)
-        best_val = min(best_val, vloss)
+        best_val, best_epoch, no_improve = _early_stop_update(
+            best_val, best_epoch, no_improve, vloss, cfg["min_delta"], ep)
         snapshots.append({k: v.detach().cpu() for k, v in model.state_dict().items()})
         if len(snapshots) > 5:
             snapshots.pop(0)
         if use_wandb:
             wandb.log({"val/loss": vloss, "epoch": ep + 1})
         print(f"epoch {ep + 1}: train {last_loss:.3f} | val {vloss:.3f} | {dt:.0f}s")
+        if not smoke and no_improve >= cfg["patience"]:
+            stop = True
+            print(f"early stop: val loss flat for {cfg['patience']} epochs (best at epoch {best_epoch}, {best_val:.4f})")
+            break
 
     # paper §5.3: average the last 5 checkpoints, then evaluate that on the test set
     avg_state = {k: torch.stack([s[k] for s in snapshots]).mean(0)
@@ -274,7 +287,8 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
     seconds_per_step = sum(epoch_times) / max(steps_done, 1)
     result = {"metrics": metrics, "train_time_s": sum(epoch_times),
               "seconds_per_step": seconds_per_step, "peak_mem_gb": peak_mem,
-              "best_val_loss": best_val}
+              "best_val_loss": best_val, "best_val_epoch": best_epoch,
+              "stopped_early": bool(stop)}
     print(f"{name} results: {result}")
 
     if use_wandb:
