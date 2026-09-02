@@ -27,7 +27,9 @@ def _rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 class RotaryEmbedding(nn.Module):
-    """Precompute cos/sin once; buffer follows models device"""
+    """Precompute cos/sin once; buffer follows models device.
+    Tables are half-based (angles repeated as two halves) to match the
+    half-split rotation convention (LLaMA-style chunk rotation)."""
 
     def __init__(self, d_k, max_len=512, base=10000.0):
         super().__init__()
@@ -35,9 +37,10 @@ class RotaryEmbedding(nn.Module):
         i = torch.arange(d_k // 2)
         freqs = 1.0 / (base ** (2 * i / d_k))
         t = torch.arange(max_len)
-        angles = t.unsqueeze(1) * freqs.unsqueeze(0)
-        self.register_buffer("cos", torch.cos(angles).repeat_interleave(2, dim=-1).view(1, 1, max_len, d_k))
-        self.register_buffer("sin", torch.sin(angles).repeat_interleave(2, dim=-1).view(1, 1, max_len, d_k))
+        angles = t.unsqueeze(1) * freqs.unsqueeze(0)   # (max_len, d_k/2)
+        full = torch.cat([angles, angles], dim=-1)     # (max_len, d_k)
+        self.register_buffer("cos", torch.cos(full).view(1, 1, max_len, d_k))
+        self.register_buffer("sin", torch.sin(full).view(1, 1, max_len, d_k))
 
     def rotate(self, q, k):
         s = q.size(2)

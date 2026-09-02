@@ -6,6 +6,8 @@ from torch.utils.data import Dataset
 import heapq, json
 import numpy as np
 
+from models.blt import BYTE_OFFSET as PACK_OFFSET, BOS_ID, EOS_ID
+
 PAD_BYTE = 0
 SPECIALS = ["<sos>","<eos>", "<pad>"]
 N_SPECIALS = len(SPECIALS)
@@ -155,16 +157,18 @@ def build_bpe_tokenizer(corpus_path, vocab_size=4000, cache_path=None):
     return tok
 
 def encode_src(tok, line, mode):
-    """mode='bpe': learned subword ids over the cipher. mode='bytes': raw byte ids."""
+    """mode='bpe': learned subword ids over the cipher.
+    mode='bytes': pack each 8-bit chunk into one byte VALUE (id = value + offset);
+    the '0'/'1' characters are the encoded data, not a text encoding."""
     if mode == "bpe":
         return tok.encode(line)
-    return list(line.encode("utf-8"))
+    return [PACK_OFFSET + int(line[i:i + 8], 2) for i in range(0, len(line) - 7, 8)]
 
 def encode_tgt(tok, line, mode):
-    """mode='bpe': sos + ids + eos. mode='bytes': raw UTF-8 byte ids"""
+    """mode='bpe': sos + ids + eos. mode='bytes': BOS + utf-8 bytes + EOS"""
     if mode == "bpe":
         return [tok.token_to_id("<sos>")] + tok.encode(line) + [tok.token_to_id("<eos>")]
-    return list(line.encode("utf-8"))
+    return [BOS_ID] + [PACK_OFFSET + b for b in line.encode("utf-8")] + [EOS_ID]
 
 class CipherDataset(Dataset):
     """Aligned (cipher-bits, plaintext) window pairs, encoded on demand."""
@@ -212,5 +216,6 @@ def bpe_decode(tok, ids):
     return tok.decode([i for i in ids if i not in specials])
 
 def bytes_to_text(ids):
-    """byte ids --> text"""
-    return bytes(ids).decode("utf-8", errors="replace")
+    """offset byte ids (with specials/padding) --> text"""
+    vals = [i - PACK_OFFSET for i in ids if i not in (0, BOS_ID, EOS_ID)]
+    return bytes(vals).decode("utf-8", errors="replace")

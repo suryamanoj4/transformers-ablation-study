@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from dataset import (CipherDataset, bpe_decode, build_bpe_tokenizer,
                      bytes_to_text, collate, load_lines)
-from models.blt import BLTModel
+from models.blt import BLTModel, BOS_ID, EOS_ID
 from models.transformer import EncoderDecoder
 import utils
 
@@ -33,13 +33,14 @@ def load_dotenv(path=".env"):
                     os.environ[key] = value
 
 BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=3,
-            dropout=0.1, max_len=256, eval_max_len=128, patch_size=8,
-            n_local_layers=2, tgt_vocab=1024, src_vocab_cipher=1024,
+            dropout=0.1, max_len=256, eval_max_len=128, patch_size=4,
+            n_local_layers=1, local_heads=4, local_window=16,
+            tgt_vocab=1024, src_vocab_cipher=1024,
             chunk_chars=32, max_train_chunks=20000, max_eval_chunks=2000,
             batch_size=64, lr=8e-4, warmup_steps=500, lr_min_ratio=0.1,
             weight_decay=0.01, grad_clip=1.0, label_smoothing=0.1,
-            amp=True, max_len_bytes=256, eval_max_len_bytes=40,
-            max_len_patches=256, local_window=512,
+            amp=True, max_len_bytes=64, eval_max_len_bytes=40,
+            max_len_patches=64,
             epochs=32, log_every=1,
             train_frac=0.8, val_frac=0.1, seed=42,
             data_dir="Dataset_A1", cipher_file="brown_cipher.txt",
@@ -173,18 +174,16 @@ def greedy_decode(model, src, sm, cfg, tokenizer, max_len):
     use_amp = torch.cuda.is_available()
     with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
         if cfg["tokenization"] == "bytes":
-            enc_out = model.global_enc(model.local_enc(src, sm[:, 0, 0]))
-            bos = model.bos.view(1, 1, -1).expand(src.size(0), 1, -1)
-            cur, out = bos, []
-            for _ in range((max_len + cfg["patch_size"] - 1) // cfg["patch_size"]):
-                reps = model.global_dec(cur, enc_out)
-                # decode with the full history of patch reps (training layout),
-                # then keep only the newly emitted patch's bytes
-                logits = model.local_dec(reps, enc_out)
-                patch = logits[:, -cfg["patch_size"]:].argmax(-1)
-                out.append(patch)
-                cur = torch.cat([cur, model.local_enc(patch)], dim=1)
-            return torch.cat(out, dim=1)[:, :max_len]
+            # byte-level autoregressive decode (matches the training layout)
+            memory, patch_ok, src_states, src_byte_mask = model.encode(src)
+            ys = torch.full((src.size(0), 1), BOS_ID, dtype=torch.long, device=src.device)
+            for _ in range(max_len):
+                logits = model.decode(ys, memory, patch_ok, src_states, src_byte_mask)[:, -1]
+                nxt = logits.argmax(-1).unsqueeze(-1)
+                ys = torch.cat([ys, nxt], dim=1)
+                if (nxt == EOS_ID).all():
+                    break
+            return ys[:, 1:]
         enc_out = model.encoder(src, sm)
         bos_id, eos_id = tokenizer.token_to_id("<sos>"), tokenizer.token_to_id("<eos>")
         tgt = torch.full((src.size(0), 1), bos_id, dtype=torch.long, device=src.device)

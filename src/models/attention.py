@@ -81,16 +81,18 @@ class GroupedQueryAttention(nn.Module):
         return self.out_proj(out)
 
 class WindowedCausalAttention(nn.Module):
-    """Causal sliding-window self-attention for BLT local blocks:
-    position i attends to [max(0, i-w), i] only -> O(S*w) compute and memory."""
+    """Sliding-window attention for BLT local blocks:
+    causal=True: position i attends [max(0, i-w), i]
+    causal=False: attends [max(0, i-w), min(S, i+w)] -> O(S*w) compute/memory."""
 
-    def __init__(self, d_model, n_heads, window, dropout=0.0, chunk=256):
+    def __init__(self, d_model, n_heads, window, dropout=0.0, chunk=256, causal=True):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.window = window
         self.chunk = chunk
+        self.causal = causal
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -107,15 +109,17 @@ class WindowedCausalAttention(nn.Module):
         for c0 in range(0, s, self.chunk):
             c1 = min(c0 + self.chunk, s)
             lo = max(0, c0 - w)
-            kk = k[:, :, lo:c1]
-            vv = v[:, :, lo:c1]
+            hi = c1 if self.causal else min(s, c1 + w)
+            kk = k[:, :, lo:hi]
+            vv = v[:, :, lo:hi]
             qq = q[:, :, c0:c1]
             sc = torch.matmul(qq, kk.transpose(-1, -2)) / math.sqrt(self.d_k)
             iq = torch.arange(c0, c1, device=x.device).view(1, 1, -1, 1)
-            ik = torch.arange(lo, c1, device=x.device).view(1, 1, 1, -1)
-            keep = (ik >= iq - w) & (ik <= iq)
+            ik = torch.arange(lo, hi, device=x.device).view(1, 1, 1, -1)
+            keep = (ik >= iq - w) & (ik <= iq) if self.causal else \
+                ((ik >= iq - w) & (ik <= iq + w))
             if mask is not None:
-                keep = keep & mask[:, :, c0:c1, lo:c1]
+                keep = keep & mask[:, :, c0:c1, lo:hi]
             sc = sc.masked_fill(~keep, float("-inf"))
             attn = self.dropout(sc.softmax(-1))
             outs.append(torch.matmul(attn, vv))
