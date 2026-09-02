@@ -1,7 +1,42 @@
 import torch
 import torch.nn as nn
 
-from models.transformer import EncoderBlock, DecoderBlock, Encoder, Decoder
+from models.attention import MultiHeadAttention, WindowedCausalAttention
+from models.transformer import PositionwiseFFN, EncoderBlock, DecoderBlock, Encoder, Decoder
+
+class _LocalEncBlock(nn.Module):
+    """windowed-causal self-attn + FFN (BLT local encoder block, paper §3.2)."""
+
+    def __init__(self, cfg, window):
+        super().__init__()
+        self.attn = WindowedCausalAttention(cfg["d_model"], cfg["n_heads"], window, cfg["dropout"])
+        self.norm1 = nn.LayerNorm(cfg["d_model"])
+        self.norm2 = nn.LayerNorm(cfg["d_model"])
+        self.ffn = PositionwiseFFN(cfg["d_model"], cfg["d_ff"], cfg["dropout"])
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+class _LocalDecBlock(nn.Module):
+    """windowed-causal self-attn + cross-attn to patches + FFN (paper §3.3)."""
+
+    def __init__(self, cfg, window):
+        super().__init__()
+        self.attn = WindowedCausalAttention(cfg["d_model"], cfg["n_heads"], window, cfg["dropout"])
+        self.cross_attn = MultiHeadAttention(cfg["d_model"], cfg["n_heads"],
+                                             max_len=cfg["max_len"], dropout=cfg["dropout"])
+        self.norm1 = nn.LayerNorm(cfg["d_model"])
+        self.norm2 = nn.LayerNorm(cfg["d_model"])
+        self.norm3 = nn.LayerNorm(cfg["d_model"])
+        self.ffn = PositionwiseFFN(cfg["d_model"], cfg["d_ff"], cfg["dropout"])
+
+    def forward(self, x, enc_out):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.cross_attn(self.norm2(x), kv=enc_out)
+        x = x + self.ffn(self.norm3(x))
+        return x
 
 class LocalEncoder(nn.Module):
     """Byte (b, s_bytes) -> patch embeddings (B, s_patches, d_model)."""
@@ -11,7 +46,8 @@ class LocalEncoder(nn.Module):
         self.patch_size = patch_size
         self.byte_embed = nn.Embedding(256, cfg["d_model"])
         self.pos_in_patch = nn.Embedding(patch_size, cfg["d_model"])
-        self.blocks = nn.ModuleList([EncoderBlock(cfg) for _ in range(n_local_layers)])
+        self.blocks = nn.ModuleList([_LocalEncBlock(cfg, cfg["local_window"])
+                                     for _ in range(n_local_layers)])
 
     def forward(self, byte_ids, byte_mask=None):
         b, s = byte_ids.size()
@@ -20,7 +56,7 @@ class LocalEncoder(nn.Module):
         x = x + self.pos_in_patch(pos)
         # smimpler -- build positions as arange over full byte sequence
         for blk in self.blocks:
-            x = blk(x, None)
+            x = blk(x)
         # reshape --> patches, masked mean over each patch's bytes
         n_patch = (s + self.patch_size -1) // self.patch_size
         pad = n_patch * self.patch_size - s
@@ -41,7 +77,8 @@ class LocalDecoder(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.pos_in_patch = nn.Embedding(patch_size, cfg["d_model"])
-        self.blocks = nn.ModuleList([DecoderBlock(cfg) for _ in range(n_local_layers)])
+        self.blocks = nn.ModuleList([_LocalDecBlock(cfg, cfg["local_window"])
+                                     for _ in range(n_local_layers)])
         self.out_proj = nn.Linear(cfg["d_model"], 256)
 
     def forward(self, patch_reps, enc_out, src_mask=None):
@@ -50,7 +87,7 @@ class LocalDecoder(nn.Module):
         pos = torch.arange(self.patch_size, device=x.device).unsqueeze(0).repeat(b, n).view(b, -1)
         x = x + self.pos_in_patch(pos)
         for blk in self.blocks:
-            x = blk(x, enc_out, src_mask=None, tgt_mask=None)
+            x = blk(x, enc_out)
         return self.out_proj(x)
 
 class BLTModel(nn.Module):

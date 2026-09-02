@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
@@ -74,6 +76,9 @@ class Encoder(nn.Module):
     def __init__(self, cfg, vocab_size=None):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg["d_model"]) if vocab_size is not None else nn.Identity()
+        if vocab_size is not None:
+            nn.init.xavier_uniform_(self.embed.weight)
+        self.emb_scale = math.sqrt(cfg["d_model"]) if vocab_size is not None else 1.0
         self.pos = (SinusoidalEmbeddings(cfg["d_model"], cfg["max_len"])
                     if not cfg["use_rope"] else nn.Identity())
         self.dropout = nn.Dropout(cfg["dropout"])
@@ -81,7 +86,7 @@ class Encoder(nn.Module):
         self.norm = _build_norm(cfg)(cfg["d_model"])
 
     def forward(self, src, src_mask=None):
-        x = self.dropout(self.pos(self.embed(src)))
+        x = self.dropout(self.pos(self.embed(src) * self.emb_scale))
         for blk in self.blocks:
             x = blk(x, src_mask)
         return self.norm(x)
@@ -90,15 +95,21 @@ class Decoder(nn.Module):
     def __init__(self, cfg, vocab_size=None, with_output_head=True):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg["d_model"]) if vocab_size is not None else nn.Identity()
+        if vocab_size is not None:
+            nn.init.xavier_uniform_(self.embed.weight)
+        self.emb_scale = math.sqrt(cfg["d_model"]) if vocab_size is not None else 1.0
         self.pos = (SinusoidalEmbeddings(cfg["d_model"], cfg["max_len"])
                     if not cfg["use_rope"] else nn.Identity())
         self.dropout = nn.Dropout(cfg["dropout"])
         self.blocks = nn.ModuleList([DecoderBlock(cfg) for _ in range(cfg["n_layers"])])
         self.norm = _build_norm(cfg)(cfg["d_model"])
         self.out_proj = nn.Linear(cfg["d_model"], vocab_size) if with_output_head else nn.Identity()
+        if with_output_head and vocab_size is not None:
+            self.out_proj.weight = self.embed.weight  # weight tying (Vaswani et al. §3.4)
+            nn.init.xavier_uniform_(self.embed.weight)  # tied head: use embed-scale init
 
     def forward(self, tgt, enc_out, src_mask=None, tgt_mask=None):
-        x = self.dropout(self.pos(self.embed(tgt)))
+        x = self.dropout(self.pos(self.embed(tgt) * self.emb_scale))
         for blk in self.blocks:
             x = blk(x, enc_out, src_mask, tgt_mask)
         return self.out_proj(self.norm(x))

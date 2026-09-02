@@ -30,11 +30,13 @@ def load_dotenv(path=".env"):
                 if key and key not in os.environ:
                     os.environ[key] = value
 
-BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=6,
+BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=3,
             dropout=0.1, max_len=512, eval_max_len=512, patch_size=8,
-            n_local_layers=2, src_vocab=256, tgt_vocab=4000,
-            src_vocab_cipher=1500,
-            batch_size=16, lr=1e-3, epochs=12, log_every=1,
+            n_local_layers=2, tgt_vocab=4000, src_vocab_cipher=1500,
+            batch_size=16, lr=1e-3, warmup_steps=2000, label_smoothing=0.1,
+            amp=True, max_len_bytes=8192, eval_max_len_bytes=2048,
+            max_len_patches=1024, local_window=512,
+            epochs=30, log_every=1,
             train_frac=0.8, val_frac=0.1, seed=42,
             data_dir="Dataset_A1", cipher_file="brown_cipher.txt",
             plain_file="brown_plain.txt")
@@ -52,29 +54,65 @@ def build_model(cfg, tgt_vocab, src_vocab=None):
     model_cfg = dict(cfg, attention=cfg["attention"], norm=cfg["norm"],
                      use_rope=cfg["use_rope"])
     if cfg["tokenization"] == "bytes":
-        return BLTModel(model_cfg, cfg["patch_size"], cfg["n_local_layers"])
-    src_vocab = cfg["src_vocab"] if src_vocab is None else src_vocab
+        mc = dict(model_cfg)
+        mc["max_len"] = max(cfg["max_len"], cfg.get("max_len_patches", 1024))
+        return BLTModel(mc, cfg["patch_size"], cfg["n_local_layers"])
+    src_vocab = 256 if src_vocab is None else src_vocab
     return EncoderDecoder(model_cfg, src_vocab_size=src_vocab,
                           tgt_vocab_size=tgt_vocab)
+
+
+def noam_lr(cfg, step):
+    """Vaswani et al. §5.3: d_model^-0.5 * min(step^-0.5, step * warmup^-1.5)."""
+    ws = max(cfg["warmup_steps"], 1)
+    return cfg["d_model"] ** -0.5 * min(step ** -0.5, step * ws ** -1.5)
+
+
+class BucketBatchSampler(torch.utils.data.Sampler):
+    """Paper §5.2: batch pairs by approximate sequence length (less padding waste)."""
+
+    def __init__(self, ds, n, batch_size, generator, k=4):
+        lens = [ds[i]["src"].numel() + ds[i]["tgt"].numel() for i in range(n)]
+        order = sorted(range(n), key=lambda i: lens[i])
+        batches = []
+        for s in range(0, n, batch_size * k):
+            chunk = order[s:s + batch_size * k]
+            perm = torch.randperm(len(chunk), generator=generator).tolist()
+            chunk = [chunk[j] for j in perm]
+            for t in range(0, len(chunk), batch_size):
+                b = chunk[t:t + batch_size]
+                if len(b) >= 4:
+                    batches.append(b)
+        self.batches = batches
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
 
 
 def make_loaders(cfg, src_tokenizer, tgt_tokenizer):
     mode = cfg["tokenization"]
     pad = 0 if mode == "bytes" else tgt_tokenizer.token_to_id("<pad>")
+    max_len = cfg["max_len_bytes"] if mode == "bytes" else cfg["max_len"]
     ds = CipherDataset(os.path.join(cfg["data_dir"], cfg["cipher_file"]),
                        os.path.join(cfg["data_dir"], cfg["plain_file"]),
-                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=cfg["max_len"])
+                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=max_len)
     gen = torch.Generator().manual_seed(cfg["seed"])
     n = len(ds)
     n_tr = int(n * cfg["train_frac"])
     n_va = int(n * cfg["val_frac"])
     tr, va, te = random_split(ds, [n_tr, n_va, n - n_tr - n_va], gen)
-    mk = lambda d: DataLoader(d, batch_size=cfg["batch_size"], shuffle=True,
+    tr_loader = DataLoader(tr, batch_size=1, shuffle=False,
+                           batch_sampler=BucketBatchSampler(tr, n_tr, cfg["batch_size"], gen),
+                           collate_fn=lambda b: collate(b, pad_tgt_id=pad))
+    mk = lambda d: DataLoader(d, batch_size=cfg["batch_size"], shuffle=False,
                               collate_fn=lambda b: collate(b, pad_tgt_id=pad))
-    return mk(tr), mk(va), mk(te)
+    return tr_loader, mk(va), mk(te)
 
 
-def train_step(model, opt, batch, cfg):
+def _logits_and_labels(model, batch, cfg):
     src, tgt, sm, tm = batch["src"], batch["tgt"], batch["src_mask"], batch["tgt_mask"]
     if cfg["tokenization"] == "bytes":
         logits = model(src, tgt, sm)
@@ -82,12 +120,43 @@ def train_step(model, opt, batch, cfg):
     else:
         logits = model(src, tgt[:, :-1], sm, tm[:, :, :, :-1])
         labels = tgt[:, 1:].masked_fill(~tm[:, 0, 0, 1:], -100)
-    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
-                           labels.reshape(-1), ignore_index=-100)
+    return logits, labels
+
+
+def train_step(model, opt, batch, cfg, scaler=None):
+    with torch.autocast("cuda", dtype=torch.float16, enabled=scaler is not None):
+        logits, labels = _logits_and_labels(model, batch, cfg)
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                               labels.reshape(-1), ignore_index=-100,
+                               label_smoothing=cfg["label_smoothing"])
     opt.zero_grad()
-    loss.backward()
-    opt.step()
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+    else:
+        loss.backward()
+        opt.step()
     return loss.item()
+
+
+@torch.no_grad()
+def val_loss(model, loader, cfg, device):
+    model.eval()
+    use_amp = torch.cuda.is_available()
+    total, ntok = 0.0, 0
+    for b in loader:
+        b = {k: v.to(device) for k, v in b.items()}
+        with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            logits, labels = _logits_and_labels(model, b, cfg)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   labels.reshape(-1), ignore_index=-100,
+                                   label_smoothing=cfg["label_smoothing"])
+        n = (labels != -100).sum().item()
+        total += loss.item() * n
+        ntok += n
+    model.train()
+    return total / max(ntok, 1)
 
 
 @torch.no_grad()
@@ -97,30 +166,34 @@ def greedy_decode(model, src, sm, cfg, tokenizer, max_len):
     src = src.to(device)
     sm = sm.to(device)
     model.eval()
-    if cfg["tokenization"] == "bytes":
-        enc_out = model.global_enc(model.local_enc(src, sm[:, 0, 0]))
-        bos = model.bos.view(1, 1, -1).expand(src.size(0), 1, -1)
-        cur, out = bos, []
-        for _ in range((max_len + cfg["patch_size"] - 1) // cfg["patch_size"]):
-            reps = model.global_dec(cur, enc_out)
-            patch = model.local_dec(reps[:, -1:], enc_out).argmax(-1)
-            out.append(patch)
-            cur = torch.cat([cur, model.local_enc(patch)], dim=1)
-        return torch.cat(out, dim=1)[:, :max_len]
-    enc_out = model.encoder(src, sm)
-    bos_id, eos_id = tokenizer.token_to_id("<sos>"), tokenizer.token_to_id("<eos>")
-    tgt = torch.full((src.size(0), 1), bos_id, dtype=torch.long, device=src.device)
-    for _ in range(max_len):
-        nxt = model.decoder(tgt, enc_out, src_mask=sm)[:, -1].argmax(-1).unsqueeze(-1)
-        tgt = torch.cat([tgt, nxt], dim=1)
-        if (nxt == eos_id).all():
-            break
-    return tgt[:, 1:]
+    use_amp = torch.cuda.is_available()
+    with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+        if cfg["tokenization"] == "bytes":
+            enc_out = model.global_enc(model.local_enc(src, sm[:, 0, 0]))
+            bos = model.bos.view(1, 1, -1).expand(src.size(0), 1, -1)
+            cur, out = bos, []
+            for _ in range((max_len + cfg["patch_size"] - 1) // cfg["patch_size"]):
+                reps = model.global_dec(cur, enc_out)
+                patch = model.local_dec(reps[:, -1:], enc_out).argmax(-1)
+                out.append(patch)
+                cur = torch.cat([cur, model.local_enc(patch)], dim=1)
+            return torch.cat(out, dim=1)[:, :max_len]
+        enc_out = model.encoder(src, sm)
+        bos_id, eos_id = tokenizer.token_to_id("<sos>"), tokenizer.token_to_id("<eos>")
+        tgt = torch.full((src.size(0), 1), bos_id, dtype=torch.long, device=src.device)
+        for _ in range(max_len):
+            nxt = model.decoder(tgt, enc_out, src_mask=sm)[:, -1].argmax(-1).unsqueeze(-1)
+            tgt = torch.cat([tgt, nxt], dim=1)
+            if (nxt == eos_id).all():
+                break
+        return tgt[:, 1:]
 
 
 def evaluate(model, loader, cfg, tokenizer, max_len=None, max_batches=None):
     model.eval()
-    max_len = cfg["eval_max_len"] if max_len is None else max_len
+    if max_len is None:
+        max_len = (cfg["eval_max_len_bytes"] if cfg["tokenization"] == "bytes"
+                   else cfg["eval_max_len"])
     refs, preds = [], []
     for i, b in enumerate(loader):
         if max_batches is not None and i >= max_batches:
@@ -142,36 +215,54 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
     print(f"\n=== {name}: attention={cfg['attention']} norm={cfg['norm']} "
           f"rope={cfg['use_rope']} tokenization={cfg['tokenization']} | {device} ===")
 
-    src_vocab = (cipher_tok.get_vocab_size() if cipher_tok is not None
-                 else cfg["src_vocab"])
+    src_vocab = (cipher_tok.get_vocab_size() if cipher_tok is not None else 256)
     tr, va, te = make_loaders(cfg, cipher_tok, tokenizer)
     model = build_model(cfg, cfg["tgt_vocab"], src_vocab).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"])
+    opt = torch.optim.AdamW(model.parameters(), lr=noam_lr(cfg, 1),
+                            betas=(0.9, 0.98), eps=1e-9)
+    scaler = (torch.amp.GradScaler(enabled=True)
+              if (cfg["amp"] and torch.cuda.is_available()) else None)
 
     if use_wandb:
         import wandb
         wandb.init(project="anlp-assignment-1", name=name, config=cfg)
 
     hist, steps_done, epoch_times = [], 0, []
-    last_loss = float("nan")
+    last_loss, best_val = float("nan"), float("inf")
+    snapshots = []
     n_epochs = 1 if smoke else cfg["epochs"]
     for ep in range(n_epochs):
         model.train()
         t0 = time.perf_counter()
         for b in tr:
             b = {k: v.to(device) for k, v in b.items()}
-            last_loss = train_step(model, opt, b, cfg)
+            lr = noam_lr(cfg, steps_done + 1)
+            for g in opt.param_groups:
+                g["lr"] = lr
+            last_loss = train_step(model, opt, b, cfg, scaler)
             steps_done += 1
             if steps_done % cfg["log_every"] == 0 or smoke:
                 hist.append((steps_done, last_loss))
                 if use_wandb:
-                    wandb.log({"train/loss": last_loss, "step": steps_done})
+                    wandb.log({"train/loss": last_loss, "train/lr": lr,
+                               "step": steps_done})
             if smoke:
                 break
         dt = time.perf_counter() - t0
         epoch_times.append(dt)
-        print(f"epoch {ep + 1}: loss {last_loss:.3f} | {dt:.0f}s")
+        vloss = val_loss(model, va, cfg, device)
+        best_val = min(best_val, vloss)
+        snapshots.append({k: v.detach().cpu() for k, v in model.state_dict().items()})
+        if len(snapshots) > 5:
+            snapshots.pop(0)
+        if use_wandb:
+            wandb.log({"val/loss": vloss, "epoch": ep + 1})
+        print(f"epoch {ep + 1}: train {last_loss:.3f} | val {vloss:.3f} | {dt:.0f}s")
 
+    # paper §5.3: average the last 5 checkpoints, then evaluate that on the test set
+    avg_state = {k: torch.stack([s[k] for s in snapshots]).mean(0)
+                 for k in snapshots[0]}
+    model.load_state_dict(avg_state)
     metrics = evaluate(model, te, cfg, tokenizer,
                        max_len=64 if smoke else None,
                        max_batches=2 if smoke else None)
@@ -182,13 +273,14 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
 
     seconds_per_step = sum(epoch_times) / max(steps_done, 1)
     result = {"metrics": metrics, "train_time_s": sum(epoch_times),
-              "seconds_per_step": seconds_per_step, "peak_mem_gb": peak_mem}
+              "seconds_per_step": seconds_per_step, "peak_mem_gb": peak_mem,
+              "best_val_loss": best_val}
     print(f"{name} results: {result}")
 
     if use_wandb:
         wandb.log({f"eval/{k}": v for k, v in metrics.items()})
         wandb.log({"eval/seconds_per_step": seconds_per_step,
-                   "eval/peak_mem_gb": peak_mem})
+                   "eval/peak_mem_gb": peak_mem, "eval/best_val_loss": best_val})
         wandb.finish()
 
     torch.save(model.state_dict(), os.path.join(OUT_DIR, f"{name}.pt"))

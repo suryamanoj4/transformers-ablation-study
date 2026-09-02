@@ -18,3 +18,7 @@ Dataset_A1/
 # Training artifacts
 outputs/
 wandb/
+
+# Misc analysis/copy dirs
+output/
+output*
