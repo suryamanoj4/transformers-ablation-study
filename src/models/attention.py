@@ -17,10 +17,12 @@ class ScaledDotProductAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(d_k)
         if mask is not None:
             if mask.dtype == torch.bool:
-                scores = scores.masked_fill(~mask, float("-inf"))
+                # finite minimum instead of -inf: fully-masked query rows then
+                # softmax to a harmless uniform distribution instead of NaN
+                scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
             else:
                 scores = scores + mask
-        attn = self.dropout(f.softmax(scores, dim=-1))
+        attn = self.dropout(f.softmax(scores.float(), dim=-1).to(scores.dtype))
         return torch.matmul(attn, v)
 
 class MultiHeadAttention(nn.Module):

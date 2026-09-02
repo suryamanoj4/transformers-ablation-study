@@ -115,8 +115,8 @@ def make_loaders(cfg, src_tokenizer, tgt_tokenizer):
 def _logits_and_labels(model, batch, cfg):
     src, tgt, sm, tm = batch["src"], batch["tgt"], batch["src_mask"], batch["tgt_mask"]
     if cfg["tokenization"] == "bytes":
-        logits = model(src, tgt, sm)
-        labels = tgt.clone().masked_fill(~tm[:, 0, 0], -100)
+        logits = model(src, tgt[:, :-1], sm)
+        labels = tgt[:, 1:].masked_fill(~tm[:, 0, 0, 1:], -100)
     else:
         logits = model(src, tgt[:, :-1], sm, tm[:, :, :, :-1])
         labels = tgt[:, 1:].masked_fill(~tm[:, 0, 0, 1:], -100)
