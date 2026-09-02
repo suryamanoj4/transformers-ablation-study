@@ -1,4 +1,5 @@
 import os
+import random
 
 import torch
 from torch.utils.data import Dataset
@@ -15,6 +16,29 @@ KEY = 4096 # key(a,b) = a*KEY + b (vocab < 4096)
 def load_lines(path):
     with open(path, encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
+
+def slice_windows(cipher, plain, win_chars, offset=0, drop_tail=True,
+                  max_items=0, seed=0):
+    """Cut aligned (cipher-bits, plaintext) pairs into short windows of a fixed
+    number of plaintext characters. The cipher uses 8 bits per char, so a window
+    must start at an offset multiple of 8 bits (win_chars itself as given) to
+    keep the repeating per-position mapping phase-aligned."""
+    out = []
+    for c, p in zip(cipher, plain):
+        start = offset
+        while start < len(p):
+            end = start + win_chars
+            if end > len(p):
+                if drop_tail:
+                    break
+                end = len(p)
+            out.append((c[8 * start: 8 * end], p[start: end]))
+            start = end
+    if max_items and len(out) > max_items:
+        rng = random.Random(seed)
+        rng.shuffle(out)
+        out = out[:max_items]
+    return out
 
 class ByteLevelBPE:
     def __init__(self, specials, merges):
@@ -143,22 +167,23 @@ def encode_tgt(tok, line, mode):
     return list(line.encode("utf-8"))
 
 class CipherDataset(Dataset):
-    def __init__(self, cipher_path, plain_path, src_tokenizer, tgt_tokenizer,
+    """Aligned (cipher-bits, plaintext) window pairs, encoded on demand."""
+
+    def __init__(self, pairs, src_tokenizer, tgt_tokenizer,
                  mode="bpe", max_len=512):
-        self.ciphers = load_lines(cipher_path)
-        self.plains = load_lines(plain_path)
-        assert len(self.ciphers) == len(self.plains)
+        self.pairs = list(pairs)
         self.src_tokenizer = src_tokenizer
         self.tgt_tokenizer = tgt_tokenizer
         self.mode = mode
         self.max_len = max_len
 
     def __len__(self):
-        return len(self.ciphers)
+        return len(self.pairs)
 
     def __getitem__(self, i):
-        src = encode_src(self.src_tokenizer, self.ciphers[i], self.mode)[: self.max_len]
-        tgt = encode_tgt(self.tgt_tokenizer, self.plains[i], self.mode)[: self.max_len]
+        bits, text = self.pairs[i]
+        src = encode_src(self.src_tokenizer, bits, self.mode)[: self.max_len]
+        tgt = encode_tgt(self.tgt_tokenizer, text, self.mode)[: self.max_len]
         return {"src": torch.tensor(src, dtype=torch.long),
                 "tgt": torch.tensor(tgt, dtype=torch.long)}
 

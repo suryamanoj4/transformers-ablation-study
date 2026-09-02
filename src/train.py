@@ -1,14 +1,16 @@
 import argparse
+import math
 import os
+import random
 import resource
 import time
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from dataset import (CipherDataset, bpe_decode, build_bpe_tokenizer,
-                     bytes_to_text, collate)
+                     bytes_to_text, collate, load_lines)
 from models.blt import BLTModel
 from models.transformer import EncoderDecoder
 import utils
@@ -31,12 +33,14 @@ def load_dotenv(path=".env"):
                     os.environ[key] = value
 
 BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=3,
-            dropout=0.1, max_len=1024, eval_max_len=512, patch_size=8,
-            n_local_layers=2, tgt_vocab=4000, src_vocab_cipher=1500,
-            batch_size=16, warmup_steps=1000, label_smoothing=0.1,
-            amp=True, max_len_bytes=12288, eval_max_len_bytes=2048,
-            max_len_patches=1024, local_window=512,
-            epochs=20, log_every=1, patience=3, min_delta=0.003,
+            dropout=0.1, max_len=256, eval_max_len=128, patch_size=8,
+            n_local_layers=2, tgt_vocab=1024, src_vocab_cipher=1024,
+            chunk_chars=32, max_train_chunks=20000, max_eval_chunks=2000,
+            batch_size=64, lr=8e-4, warmup_steps=500, lr_min_ratio=0.1,
+            weight_decay=0.01, grad_clip=1.0, label_smoothing=0.1,
+            amp=True, max_len_bytes=256, eval_max_len_bytes=256,
+            max_len_patches=256, local_window=512,
+            epochs=32, log_every=1,
             train_frac=0.8, val_frac=0.1, seed=42,
             data_dir="Dataset_A1", cipher_file="brown_cipher.txt",
             plain_file="brown_plain.txt")
@@ -62,57 +66,48 @@ def build_model(cfg, tgt_vocab, src_vocab=None):
                           tgt_vocab_size=tgt_vocab)
 
 
-def noam_lr(cfg, step):
-    """Inverse-sqrt LR with linear warmup: d_model^-0.5 * min(step^-0.5, step * warmup^-1.5)."""
-    ws = max(cfg["warmup_steps"], 1)
-    return cfg["d_model"] ** -0.5 * min(step ** -0.5, step * ws ** -1.5)
-
-
-class BucketBatchSampler(torch.utils.data.Sampler):
-    """Batch pairs grouped by approximate sequence length (less padding waste).
-    Batch order is re-shuffled every epoch (same generator -> reproducible)."""
-
-    def __init__(self, ds, n, batch_size, generator, k=4):
-        self.generator = generator
-        lens = [ds[i]["src"].numel() + ds[i]["tgt"].numel() for i in range(n)]
-        order = sorted(range(n), key=lambda i: lens[i])
-        batches = []
-        for s in range(0, n, batch_size * k):
-            chunk = order[s:s + batch_size * k]
-            perm = torch.randperm(len(chunk), generator=generator).tolist()
-            chunk = [chunk[j] for j in perm]
-            for t in range(0, len(chunk), batch_size):
-                b = chunk[t:t + batch_size]
-                if len(b) >= 4:
-                    batches.append(b)
-        self.batches = batches
-
-    def __iter__(self):
-        perm = torch.randperm(len(self.batches), generator=self.generator).tolist()
-        for i in perm:
-            yield self.batches[i]
-
-    def __len__(self):
-        return len(self.batches)
+def lr_lambda(step, warmup, total, min_ratio=0.1):
+    """Warmup + cosine decay to `min_ratio` of the peak LR."""
+    if step < warmup:
+        return (step + 1.0) / warmup
+    prog = min((step - warmup) / max(total - warmup, 1), 1.0)
+    return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * prog))
 
 
 def make_loaders(cfg, src_tokenizer, tgt_tokenizer):
+    """Line-level split, then windowed examples (phase-0 aligned chunks)."""
+    from dataset import slice_windows
     mode = cfg["tokenization"]
     pad = 0 if mode == "bytes" else tgt_tokenizer.token_to_id("<pad>")
-    max_len = cfg["max_len_bytes"] if mode == "bytes" else cfg["max_len"]
-    ds = CipherDataset(os.path.join(cfg["data_dir"], cfg["cipher_file"]),
-                       os.path.join(cfg["data_dir"], cfg["plain_file"]),
-                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=max_len)
-    gen = torch.Generator().manual_seed(cfg["seed"])
-    n = len(ds)
-    n_tr = int(n * cfg["train_frac"])
-    n_va = int(n * cfg["val_frac"])
-    tr, va, te = random_split(ds, [n_tr, n_va, n - n_tr - n_va], gen)
-    tr_loader = DataLoader(tr, batch_size=1, shuffle=False,
-                           batch_sampler=BucketBatchSampler(tr, n_tr, cfg["batch_size"], gen),
+    cipher = load_lines(os.path.join(cfg["data_dir"], cfg["cipher_file"]))
+    plain = load_lines(os.path.join(cfg["data_dir"], cfg["plain_file"]))
+    assert len(cipher) == len(plain)
+
+    idx = list(range(len(plain)))
+    rng = random.Random(cfg["seed"])
+    rng.shuffle(idx)
+    n_tr = int(len(plain) * cfg["train_frac"])
+    n_va = int(len(plain) * cfg["val_frac"])
+    tr_i, va_i, te_i = idx[:n_tr], idx[n_tr:n_tr + n_va], idx[n_tr + n_va:]
+
+    def pairs(ii, cap, seed):
+        sel_c = [cipher[i] for i in ii]
+        sel_p = [plain[i] for i in ii]
+        return slice_windows(sel_c, sel_p, cfg["chunk_chars"],
+                             max_items=cap, seed=seed)
+
+    def mk(ds):
+        return DataLoader(ds, batch_size=cfg["batch_size"], shuffle=False,
+                          collate_fn=lambda b: collate(b, pad_tgt_id=pad))
+    win = cfg["max_len_bytes"] if mode == "bytes" else cfg["max_len"]
+    tr = CipherDataset(pairs(tr_i, cfg["max_train_chunks"], cfg["seed"]),
+                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=win)
+    va = CipherDataset(pairs(va_i, cfg["max_eval_chunks"], cfg["seed"] + 1),
+                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=win)
+    te = CipherDataset(pairs(te_i, cfg["max_eval_chunks"], cfg["seed"] + 2),
+                       src_tokenizer, tgt_tokenizer, mode=mode, max_len=win)
+    tr_loader = DataLoader(tr, batch_size=cfg["batch_size"], shuffle=True,
                            collate_fn=lambda b: collate(b, pad_tgt_id=pad))
-    mk = lambda d: DataLoader(d, batch_size=cfg["batch_size"], shuffle=False,
-                              collate_fn=lambda b: collate(b, pad_tgt_id=pad))
     return tr_loader, mk(va), mk(te)
 
 
@@ -133,19 +128,25 @@ def train_step(model, opt, batch, cfg, scaler=None):
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                labels.reshape(-1), ignore_index=-100,
                                label_smoothing=cfg["label_smoothing"])
-    opt.zero_grad()
+    opt.zero_grad(set_to_none=True)
     if scaler is not None:
         scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+    else:
+        loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+    if scaler is not None:
         scaler.step(opt)
         scaler.update()
     else:
-        loss.backward()
         opt.step()
     return loss.item()
 
 
 @torch.no_grad()
 def val_loss(model, loader, cfg, device):
+    """Plain cross-entropy (no smoothing) over the val set: the model-selection
+    signal, comparable across configs."""
     model.eval()
     use_amp = torch.cuda.is_available()
     total, ntok = 0.0, 0
@@ -154,8 +155,7 @@ def val_loss(model, loader, cfg, device):
         with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
             logits, labels = _logits_and_labels(model, b, cfg)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
-                                   labels.reshape(-1), ignore_index=-100,
-                                   label_smoothing=cfg["label_smoothing"])
+                                   labels.reshape(-1), ignore_index=-100)
         n = (labels != -100).sum().item()
         total += loss.item() * n
         ntok += n
@@ -213,13 +213,6 @@ def evaluate(model, loader, cfg, tokenizer, max_len=None, max_batches=None):
     return utils.evaluate_texts(preds, refs, tokenized=(cfg["tokenization"] == "bpe"))
 
 
-def _early_stop_update(best_val, best_epoch, no_improve, vloss, min_delta, ep):
-    """returns (best_val, best_epoch, no_improve) after one epoch's val loss."""
-    if vloss < best_val - min_delta:
-        return vloss, ep + 1, 0
-    return best_val, best_epoch, no_improve + 1
-
-
 def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wandb=True):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(cfg["seed"])
@@ -229,8 +222,15 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
     src_vocab = (cipher_tok.get_vocab_size() if cipher_tok is not None else 256)
     tr, va, te = make_loaders(cfg, cipher_tok, tokenizer)
     model = build_model(cfg, cfg["tgt_vocab"], src_vocab).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=noam_lr(cfg, 1),
-                            betas=(0.9, 0.98), eps=1e-9)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                            betas=(0.9, 0.98), weight_decay=cfg["weight_decay"],
+                            eps=1e-9)
+    steps_per_epoch = max(len(tr), 1)
+    n_epochs = 1 if smoke else cfg["epochs"]
+    total_steps = n_epochs * steps_per_epoch
+    warmup = min(cfg["warmup_steps"], max(1, total_steps // 10))
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: lr_lambda(s, warmup, total_steps, cfg["lr_min_ratio"]))
     scaler = (torch.amp.GradScaler(enabled=True)
               if (cfg["amp"] and torch.cuda.is_available()) else None)
 
@@ -238,61 +238,61 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
         import wandb
         wandb.init(project="anlp-assignment-1", name=name, config=cfg)
 
-    hist, steps_done, epoch_times = [], 0, []
-    last_loss, best_val = float("nan"), float("inf")
-    snapshots = []
-    best_epoch, no_improve, stop = 0, 0, False
-    n_epochs = 1 if smoke else cfg["epochs"]
+    hist, steps_done, step_times = [], 0, []
+    last_loss, best_val, best_step = float("nan"), float("inf"), 0
+    best_state = None
+    t0_all = time.perf_counter()
     for ep in range(n_epochs):
         model.train()
-        t0 = time.perf_counter()
+        ep_t0 = time.perf_counter()
+        ep_losses = []
         for b in tr:
             b = {k: v.to(device) for k, v in b.items()}
-            lr = noam_lr(cfg, steps_done + 1)
-            for g in opt.param_groups:
-                g["lr"] = lr
+            t0 = time.perf_counter()
             last_loss = train_step(model, opt, b, cfg, scaler)
+            sched.step()
             steps_done += 1
+            step_times.append(time.perf_counter() - t0)
+            ep_losses.append(last_loss)
+            lr_now = sched.get_last_lr()[0]
             if steps_done % cfg["log_every"] == 0 or smoke:
                 hist.append((steps_done, last_loss))
                 if use_wandb:
-                    wandb.log({"train/loss": last_loss, "train/lr": lr,
+                    wandb.log({"train/loss": last_loss, "train/lr": lr_now,
                                "step": steps_done})
             if smoke:
                 break
-        dt = time.perf_counter() - t0
-        epoch_times.append(dt)
+        dt = time.perf_counter() - ep_t0
         vloss = val_loss(model, va, cfg, device)
-        best_val, best_epoch, no_improve = _early_stop_update(
-            best_val, best_epoch, no_improve, vloss, cfg["min_delta"], ep)
-        snapshots.append({k: v.detach().cpu() for k, v in model.state_dict().items()})
-        if len(snapshots) > 5:
-            snapshots.pop(0)
+        if vloss < best_val:
+            best_val, best_step = vloss, steps_done
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        print(f"epoch {ep + 1}/{n_epochs}: train {sum(ep_losses) / max(len(ep_losses), 1):.4f} | "
+              f"val {vloss:.4f} | lr {sched.get_last_lr()[0]:.2e} | {dt:.0f}s")
         if use_wandb:
             wandb.log({"val/loss": vloss, "epoch": ep + 1})
-        print(f"epoch {ep + 1}: train {last_loss:.3f} | val {vloss:.3f} | {dt:.0f}s")
-        if not smoke and no_improve >= cfg["patience"]:
-            stop = True
-            print(f"early stop: val loss flat for {cfg['patience']} epochs (best at epoch {best_epoch}, {best_val:.4f})")
-            break
 
-    # average the last 5 epoch snapshots, then evaluate that on the test set
-    avg_state = {k: torch.stack([s[k] for s in snapshots]).mean(0)
-                 for k in snapshots[0]}
-    model.load_state_dict(avg_state)
+    if best_state is None:
+        best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    model.load_state_dict(best_state)
     metrics = evaluate(model, te, cfg, tokenizer,
-                       max_len=64 if smoke else None,
+                       max_len=32 if smoke else None,
                        max_batches=2 if smoke else None)
     if torch.cuda.is_available():
         peak_mem = torch.cuda.max_memory_allocated() / 1e9
     else:
         peak_mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
 
-    seconds_per_step = sum(epoch_times) / max(steps_done, 1)
-    result = {"metrics": metrics, "train_time_s": sum(epoch_times),
+    train_time_s = time.perf_counter() - t0_all
+    seconds_per_step = sum(step_times) / max(steps_done, 1)
+    n_params = sum(p.numel() for p in model.parameters())
+    kv_params = sum(p.numel() for n_, p in model.named_parameters()
+                    if "k_proj" in n_ or "v_proj" in n_)
+    result = {"metrics": metrics, "train_time_s": train_time_s,
               "seconds_per_step": seconds_per_step, "peak_mem_gb": peak_mem,
-              "best_val_loss": best_val, "best_val_epoch": best_epoch,
-              "stopped_early": bool(stop)}
+              "best_val_loss": best_val, "best_val_step": best_step,
+              "n_steps": steps_done, "n_epochs": ep + 1,
+              "params": n_params, "kv_params": kv_params}
     print(f"{name} results: {result}")
 
     if use_wandb:
@@ -301,6 +301,7 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
                    "eval/peak_mem_gb": peak_mem, "eval/best_val_loss": best_val})
         wandb.finish()
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(OUT_DIR, f"{name}.pt"))
     return result, hist
 
@@ -309,7 +310,7 @@ def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs", default="all", help="e.g. C1,C2 or all")
-    ap.add_argument("--smoke", action="store_true", help="1 batch, 1 epoch, no wandb")
+    ap.add_argument("--smoke", action="store_true", help="few steps, no wandb")
     ap.add_argument("--no-wandb", action="store_true")
     args = ap.parse_args()
 
