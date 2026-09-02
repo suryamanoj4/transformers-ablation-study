@@ -81,7 +81,7 @@ class GroupedQueryAttention(nn.Module):
         return self.out_proj(out)
 
 class WindowedCausalAttention(nn.Module):
-    """Causal sliding-window self-attention for BLT local blocks (paper §3.2):
+    """Causal sliding-window self-attention for BLT local blocks:
     position i attends to [max(0, i-w), i] only -> O(S*w) compute and memory."""
 
     def __init__(self, d_model, n_heads, window, dropout=0.0, chunk=256):

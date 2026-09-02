@@ -105,7 +105,7 @@ class Decoder(nn.Module):
         self.norm = _build_norm(cfg)(cfg["d_model"])
         self.out_proj = nn.Linear(cfg["d_model"], vocab_size) if with_output_head else nn.Identity()
         if with_output_head and vocab_size is not None:
-            self.out_proj.weight = self.embed.weight  # weight tying (Vaswani et al. §3.4)
+            self.out_proj.weight = self.embed.weight  # weight tying (shared embedding/head)
             nn.init.xavier_uniform_(self.embed.weight)  # tied head: use embed-scale init
 
     def forward(self, tgt, enc_out, src_mask=None, tgt_mask=None):

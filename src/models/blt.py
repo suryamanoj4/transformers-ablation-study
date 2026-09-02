@@ -5,7 +5,7 @@ from models.attention import MultiHeadAttention, WindowedCausalAttention
 from models.transformer import PositionwiseFFN, EncoderBlock, DecoderBlock, Encoder, Decoder
 
 class _LocalEncBlock(nn.Module):
-    """windowed-causal self-attn + FFN (BLT local encoder block, paper §3.2)."""
+    """windowed-causal self-attn + FFN (BLT local encoder block)."""
 
     def __init__(self, cfg, window):
         super().__init__()
@@ -20,7 +20,7 @@ class _LocalEncBlock(nn.Module):
         return x
 
 class _LocalDecBlock(nn.Module):
-    """windowed-causal self-attn + cross-attn to patches + FFN (paper §3.3)."""
+    """windowed-causal self-attn + cross-attn to patches + FFN (BLT local decoder block)."""
 
     def __init__(self, cfg, window):
         super().__init__()

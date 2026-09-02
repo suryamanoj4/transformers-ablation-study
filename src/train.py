@@ -31,10 +31,10 @@ def load_dotenv(path=".env"):
                     os.environ[key] = value
 
 BASE = dict(d_model=256, d_ff=1024, n_heads=8, n_kv_heads=2, n_layers=3,
-            dropout=0.1, max_len=512, eval_max_len=512, patch_size=8,
+            dropout=0.1, max_len=1024, eval_max_len=512, patch_size=8,
             n_local_layers=2, tgt_vocab=4000, src_vocab_cipher=1500,
-            batch_size=32, warmup_steps=1000, label_smoothing=0.1,
-            amp=True, max_len_bytes=8192, eval_max_len_bytes=2048,
+            batch_size=16, warmup_steps=1000, label_smoothing=0.1,
+            amp=True, max_len_bytes=12288, eval_max_len_bytes=2048,
             max_len_patches=1024, local_window=512,
             epochs=20, log_every=1, patience=3, min_delta=0.003,
             train_frac=0.8, val_frac=0.1, seed=42,
@@ -63,15 +63,17 @@ def build_model(cfg, tgt_vocab, src_vocab=None):
 
 
 def noam_lr(cfg, step):
-    """Vaswani et al. §5.3: d_model^-0.5 * min(step^-0.5, step * warmup^-1.5)."""
+    """Inverse-sqrt LR with linear warmup: d_model^-0.5 * min(step^-0.5, step * warmup^-1.5)."""
     ws = max(cfg["warmup_steps"], 1)
     return cfg["d_model"] ** -0.5 * min(step ** -0.5, step * ws ** -1.5)
 
 
 class BucketBatchSampler(torch.utils.data.Sampler):
-    """Paper §5.2: batch pairs by approximate sequence length (less padding waste)."""
+    """Batch pairs grouped by approximate sequence length (less padding waste).
+    Batch order is re-shuffled every epoch (same generator -> reproducible)."""
 
     def __init__(self, ds, n, batch_size, generator, k=4):
+        self.generator = generator
         lens = [ds[i]["src"].numel() + ds[i]["tgt"].numel() for i in range(n)]
         order = sorted(range(n), key=lambda i: lens[i])
         batches = []
@@ -86,7 +88,9 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         self.batches = batches
 
     def __iter__(self):
-        return iter(self.batches)
+        perm = torch.randperm(len(self.batches), generator=self.generator).tolist()
+        for i in perm:
+            yield self.batches[i]
 
     def __len__(self):
         return len(self.batches)
@@ -272,7 +276,7 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
             print(f"early stop: val loss flat for {cfg['patience']} epochs (best at epoch {best_epoch}, {best_val:.4f})")
             break
 
-    # paper §5.3: average the last 5 checkpoints, then evaluate that on the test set
+    # average the last 5 epoch snapshots, then evaluate that on the test set
     avg_state = {k: torch.stack([s[k] for s in snapshots]).mean(0)
                  for k in snapshots[0]}
     model.load_state_dict(avg_state)
