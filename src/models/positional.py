@@ -39,8 +39,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", torch.cos(angles).repeat_interleave(2, dim=-1).view(1, 1, max_len, d_k))
         self.register_buffer("sin", torch.sin(angles).repeat_interleave(2, dim=-1).view(1, 1, max_len, d_k))
 
-    def rotate(self,q, k):
+    def rotate(self, q, k):
         s = q.size(2)
-        cos = self.cos[:, :, :s]
-        sin = self.sin[:, :, :s]
+        cos = self.cos[:, :, :s].to(q.dtype)
+        sin = self.sin[:, :, :s].to(q.dtype)
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
