@@ -178,7 +178,10 @@ def greedy_decode(model, src, sm, cfg, tokenizer, max_len):
             cur, out = bos, []
             for _ in range((max_len + cfg["patch_size"] - 1) // cfg["patch_size"]):
                 reps = model.global_dec(cur, enc_out)
-                patch = model.local_dec(reps[:, -1:], enc_out).argmax(-1)
+                # decode with the full history of patch reps (training layout),
+                # then keep only the newly emitted patch's bytes
+                logits = model.local_dec(reps, enc_out)
+                patch = logits[:, -cfg["patch_size"]:].argmax(-1)
                 out.append(patch)
                 cur = torch.cat([cur, model.local_enc(patch)], dim=1)
             return torch.cat(out, dim=1)[:, :max_len]
@@ -299,6 +302,7 @@ def train_one_config(name, cfg, tokenizer, cipher_tok=None, smoke=False, use_wan
         wandb.log({f"eval/{k}": v for k, v in metrics.items()})
         wandb.log({"eval/seconds_per_step": seconds_per_step,
                    "eval/peak_mem_gb": peak_mem, "eval/best_val_loss": best_val})
+        wandb.summary.update({f"test/{k}": v for k, v in metrics.items()})
         wandb.finish()
 
     os.makedirs(OUT_DIR, exist_ok=True)
