@@ -16,9 +16,4 @@ Dataset_A1/
 .env
 
 # Training artifacts
-outputs/
 wandb/
-
-# Misc analysis/copy dirs
-output/
-output*

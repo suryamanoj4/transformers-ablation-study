@@ -1,0 +1,98 @@
+{
+  "C1": {
+    "metrics": {
+      "bit_accuracy": 0.9668371170343136,
+      "sequence_accuracy": 0.656,
+      "levenshtein": 0.682,
+      "bleu": 0.9687698507302863,
+      "rouge1": 0.9281753358569536,
+      "rouge2": 0.8775204254079254,
+      "rougeL": 0.9281753358569536
+    },
+    "train_time_s": 1014.1742104490002,
+    "seconds_per_step": 0.04191960135852563,
+    "peak_mem_gb": 0.497078272,
+    "best_val_loss": 0.1986182897419535,
+    "best_val_step": 10016,
+    "n_steps": 10016,
+    "n_epochs": 32,
+    "params": 6048256,
+    "kv_params": 1179648
+  },
+  "C2": {
+    "metrics": {
+      "bit_accuracy": 0.5520113347052245,
+      "sequence_accuracy": 0.0,
+      "levenshtein": 31.337,
+      "bleu": 0.28491442966428215,
+      "rouge1": 0.29913681510869666,
+      "rouge2": 0.06408169646830637,
+      "rougeL": 0.2732497746523686
+    },
+    "train_time_s": 1038.24668045,
+    "seconds_per_step": 0.042012468047620787,
+    "peak_mem_gb": 0.497143808,
+    "best_val_loss": 2.7872085275229765,
+    "best_val_step": 5634,
+    "n_steps": 10016,
+    "n_epochs": 32,
+    "params": 6048256,
+    "kv_params": 1179648
+  },
+  "C3": {
+    "metrics": {
+      "bit_accuracy": 0.9119832524629169,
+      "sequence_accuracy": 0.387,
+      "levenshtein": 2.149,
+      "bleu": 0.896698259759557,
+      "rouge1": 0.8353807201011924,
+      "rouge2": 0.7122843493108199,
+      "rougeL": 0.8353807201011924
+    },
+    "train_time_s": 1031.4183906470003,
+    "seconds_per_step": 0.04354197273042763,
+    "peak_mem_gb": 0.497143808,
+    "best_val_loss": 0.45447166721959426,
+    "best_val_step": 10016,
+    "n_steps": 10016,
+    "n_epochs": 32,
+    "params": 5163520,
+    "kv_params": 294912
+  },
+  "C4": {
+    "metrics": {
+      "bit_accuracy": 0.9643610043252046,
+      "sequence_accuracy": 0.63,
+      "levenshtein": 0.7135,
+      "bleu": 0.9662677024225836,
+      "rouge1": 0.9219205310212665,
+      "rouge2": 0.8665802267177267,
+      "rougeL": 0.9219205310212665
+    },
+    "train_time_s": 996.8858212810001,
+    "seconds_per_step": 0.03980137121465459,
+    "peak_mem_gb": 0.497143808,
+    "best_val_loss": 0.20476884263361325,
+    "best_val_step": 10016,
+    "n_steps": 10016,
+    "n_epochs": 32,
+    "params": 6043136,
+    "kv_params": 1179648
+  },
+  "C5": {
+    "metrics": {
+      "bit_accuracy": 0.99960546875,
+      "sequence_accuracy": 0.96,
+      "levenshtein": 0.0455
+    },
+    "train_time_s": 744.8859731790008,
+    "seconds_per_step": 0.06524238529881557,
+    "peak_mem_gb": 0.497143808,
+    "best_val_loss": 0.06361866825819015,
+    "best_val_step": 1565,
+    "n_steps": 10016,
+    "n_epochs": 32,
+    "params": 9407236,
+    "kv_params": 1966080
+  }
+}
