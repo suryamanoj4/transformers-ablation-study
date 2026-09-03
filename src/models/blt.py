@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from models.attention import MultiHeadAttention, WindowedCausalAttention
 from models.positional import SinusoidalEmbeddings
-from models.transformer import PositionwiseFFN, Encoder, Decoder
+from models.transformer import PositionwiseFFN, Encoder, Decoder, init_model_params
 
 # byte values are stored with this offset so ids never collide with pad=0;
 # ids: 0=pad, 1=bos, 2=eos, 3=unused, 4..259=bytes, vocab=260
@@ -157,6 +157,7 @@ class BLTModel(nn.Module):
         self.global_dec = Decoder(cfg, vocab_size=None, with_output_head=False)
         self.start_patch = nn.Parameter(torch.zeros(1, 1, cfg["d_model"]))
         nn.init.normal_(self.start_patch, std=0.02)
+        init_model_params(self)
 
     def _starts(self, byte_ids):
         b, l = byte_ids.shape

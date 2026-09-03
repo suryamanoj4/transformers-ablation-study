@@ -59,6 +59,7 @@ class DecoderBlock(nn.Module):
         norm = _build_norm(cfg)
         self.norm1 = norm(cfg["d_model"])
         self.norm2 = norm(cfg["d_model"])
+        self.norm_mem = norm(cfg["d_model"])
         self.norm3 = norm(cfg["d_model"])
         self.ffn = PositionwiseFFN(cfg["d_model"], cfg["d_ff"], cfg["dropout"])
 
@@ -68,7 +69,7 @@ class DecoderBlock(nn.Module):
         causal = causal.unsqueeze(0).unsqueeze(0)
         self_mask = causal if tgt_mask is None else causal & tgt_mask
         x = x + self.self_attn(self.norm1(x), mask=self_mask)
-        x = x + self.cross_attn(self.norm2(x), kv=enc_out, mask=src_mask)
+        x = x + self.cross_attn(self.norm2(x), kv=self.norm_mem(enc_out), mask=src_mask)
         x = x + self.ffn(self.norm3(x))
         return x
 
@@ -114,6 +115,19 @@ class Decoder(nn.Module):
             x = blk(x, enc_out, src_mask, tgt_mask)
         return self.out_proj(self.norm(x))
 
+def init_model_params(model):
+    """Reference-style init: embeddings N(0, 0.02), everything else xavier."""
+    emb_ids = {id(m.weight) for m in model.modules() if isinstance(m, nn.Embedding)}
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+    for m in model.modules():
+        if isinstance(m, nn.Linear) and id(m.weight) not in emb_ids:
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+
 class EncoderDecoder(nn.Module):
     """Full Model. cfg keys: d_model, d_ff, n_heads, n_kv_heads, n_layers, dropout,
     max_len, use_rope, attention ('mha'|'gqa'), norm ('layernorm'|'rmsnorm')"""
@@ -122,6 +136,7 @@ class EncoderDecoder(nn.Module):
         super().__init__()
         self.encoder = Encoder(cfg, src_vocab_size)
         self.decoder = Decoder(cfg, tgt_vocab_size)
+        init_model_params(self)
 
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
         enc_out = self.encoder(src, src_mask)

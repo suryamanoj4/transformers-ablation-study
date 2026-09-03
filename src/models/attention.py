@@ -33,10 +33,10 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.rope = RotaryEmbedding(self.d_k, max_len) if use_rope else None
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.attn = ScaledDotProductAttention(dropout)
 
     def forward(self, x, kv=None, mask=None):
@@ -61,10 +61,10 @@ class GroupedQueryAttention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.d_k = d_model // n_heads
         self.rope = RotaryEmbedding(self.d_k, max_len) if use_rope else None
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, self.n_kv_heads * self.d_k)
-        self.v_proj = nn.Linear(d_model, self.n_kv_heads * self.d_k)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, self.n_kv_heads * self.d_k, bias=False)
+        self.v_proj = nn.Linear(d_model, self.n_kv_heads * self.d_k, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.attn = ScaledDotProductAttention(dropout)
 
     def forward(self, x, kv=None, mask=None):
@@ -95,10 +95,10 @@ class WindowedCausalAttention(nn.Module):
         self.window = window
         self.chunk = chunk
         self.causal = causal
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
