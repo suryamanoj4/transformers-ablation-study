@@ -157,7 +157,7 @@ class BLTModel(nn.Module):
         self.global_dec = Decoder(cfg, vocab_size=None, with_output_head=False)
         self.start_patch = nn.Parameter(torch.zeros(1, 1, cfg["d_model"]))
         nn.init.normal_(self.start_patch, std=0.02)
-        init_model_params(self)
+        init_model_params(self, pad_id=0)
 
     def _starts(self, byte_ids):
         b, l = byte_ids.shape

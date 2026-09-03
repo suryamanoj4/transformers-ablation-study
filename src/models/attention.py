@@ -38,6 +38,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.attn = ScaledDotProductAttention(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x, kv=None, mask=None):
         kv = x if kv is None else kv
@@ -49,7 +50,7 @@ class MultiHeadAttention(nn.Module):
             q, k = self.rope.rotate(q, k)
         out = self.attn(q ,k ,v ,mask=mask)
         out = out.transpose(1, 2).contiguous().view(b, s, self.d_model)
-        return self.out_proj(out)
+        return self.resid_dropout(self.out_proj(out))
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, max_len=512, dropout=0.0, use_rope=False):
@@ -66,6 +67,7 @@ class GroupedQueryAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, self.n_kv_heads * self.d_k, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.attn = ScaledDotProductAttention(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x, kv=None, mask=None):
         kv = x if kv is None else kv
@@ -80,7 +82,7 @@ class GroupedQueryAttention(nn.Module):
         v = v.repeat_interleave(group, dim=1)
         out = self.attn(q ,k ,v ,mask=mask)
         out = out.transpose(1, 2).contiguous().view(b, s, self.d_model)
-        return self.out_proj(out)
+        return self.resid_dropout(self.out_proj(out))
 
 class WindowedCausalAttention(nn.Module):
     """Sliding-window attention for BLT local blocks:
@@ -100,6 +102,7 @@ class WindowedCausalAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
         b, s, _ = x.size()
@@ -126,4 +129,4 @@ class WindowedCausalAttention(nn.Module):
             attn = self.dropout(sc.softmax(-1))
             outs.append(torch.matmul(attn, vv))
         o = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, s, -1)
-        return self.out_proj(o)
+        return self.resid_dropout(self.out_proj(o))

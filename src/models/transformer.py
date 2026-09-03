@@ -29,9 +29,10 @@ class PositionwiseFFN(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ff)
         self.fc2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.fc2(self.dropout(f.gelu(self.fc1(x))))
+        return self.dropout2(self.fc2(self.dropout(f.gelu(self.fc1(x)))))
 
 class EncoderBlock(nn.Module):
     """pre norm block"""
@@ -77,8 +78,6 @@ class Encoder(nn.Module):
     def __init__(self, cfg, vocab_size=None):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg["d_model"]) if vocab_size is not None else nn.Identity()
-        if vocab_size is not None:
-            nn.init.xavier_uniform_(self.embed.weight)
         self.emb_scale = math.sqrt(cfg["d_model"]) if vocab_size is not None else 1.0
         self.pos = (SinusoidalEmbeddings(cfg["d_model"], cfg["max_len"])
                     if not cfg["use_rope"] else nn.Identity())
@@ -96,8 +95,6 @@ class Decoder(nn.Module):
     def __init__(self, cfg, vocab_size=None, with_output_head=True):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, cfg["d_model"]) if vocab_size is not None else nn.Identity()
-        if vocab_size is not None:
-            nn.init.xavier_uniform_(self.embed.weight)
         self.emb_scale = math.sqrt(cfg["d_model"]) if vocab_size is not None else 1.0
         self.pos = (SinusoidalEmbeddings(cfg["d_model"], cfg["max_len"])
                     if not cfg["use_rope"] else nn.Identity())
@@ -115,8 +112,9 @@ class Decoder(nn.Module):
             x = blk(x, enc_out, src_mask, tgt_mask)
         return self.out_proj(self.norm(x))
 
-def init_model_params(model):
-    """Reference-style init: embeddings N(0, 0.02), everything else xavier."""
+def init_model_params(model, pad_id=2):
+    """Reference-style init: embeddings N(0, 0.02), everything else xavier,
+    padding-id embedding row zeroed (so masked positions contribute nothing)."""
     emb_ids = {id(m.weight) for m in model.modules() if isinstance(m, nn.Embedding)}
     for m in model.modules():
         if isinstance(m, nn.Embedding):
@@ -126,6 +124,11 @@ def init_model_params(model):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
+    if pad_id is not None:
+        for m in model.modules():
+            if isinstance(m, nn.Embedding) and pad_id < m.weight.size(0):
+                with torch.no_grad():
+                    m.weight[pad_id].zero_()
 
 
 class EncoderDecoder(nn.Module):
